@@ -1,0 +1,507 @@
+---
+title: "NFL Drives"
+author: "Gordon Liang"
+format: html
+editor: visual
+---
+# Loading Libraries in
+```{r}
+#| message: FALSE
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(mgcv)
+library(rsample)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+set.seed(7)
+drives = read.csv('../NHL/NFL Drives 2015-2022 RAW.csv')
+field_goals = read.csv('../NHL/NFL Field Goals 2010-2022.csv')
+fourth = read.csv('../NHL/NFL Fourth Downs 2010-2022.csv')
+punts = read.csv('../NHL/NFL Punts 2010-2022.csv')
+```
+# Drive Results
+
+## Data Cleaning
+
+### Looking At Point Differentials
+```{r}
+drives = drives %>%
+  mutate(Team_Diff = Team.Score.at.End - Team.Score.at.Start,
+         Opp_Diff = Opp.Score.at.End - Opponent.Score.at.Start,
+         Lead_Diff = Team_Diff - Opp_Diff)
+drives %>%
+  ggplot(mapping = aes(x = Yards.From.Own.Endzone..Start.,
+                       y = Lead_Diff)) +
+  geom_point() +
+  labs(x = 'Yards From Own Endzone to Start Drive',
+       y = 'Lead Differential After Drive',
+       title = 'Some Rows Are Errant Because of Impossible Point Differentials')
+```
+### Setting Possible Point Differentials From a Drive
+```{r}
+valid_diffs = c(-8, -7, -6, -2, 0, 2, 3, 6, 7, 8)
+impossible_diff = drives %>%
+  filter(! Lead_Diff %in% valid_diffs)
+nrow(impossible_diff)/nrow(drives)
+```
+4% of the data isn't within a valid point differential which is somewhat insignificant to where it can be removed but let's look into other possibilities first.
+
+
+### Exploring Data Points with Impossible Point Differentials
+```{r}
+head(impossible_diff)
+```
+From surfing through some rows with an impossible lead differential, we notice that in many cases, the end results swapped the scores.
+
+### Find Rows Where BOTH Team and Opponent Scores Swapped
+```{r}
+potentialSwaps = impossible_diff %>%
+  filter((Team.Score.at.Start != Team.Score.at.End) & (Opp.Score.at.End != Opponent.Score.at.Start))
+nrow(potentialSwaps)/nrow(impossible_diff)
+nrow(impossible_diff) - nrow(potentialSwaps)
+```
+All but 129 of the impossible lead differentials can *potentially* be swapped for a valid value.
+
+### Swap the End Result of Those Columns
+```{r}
+potentialSwaps = potentialSwaps %>%
+  mutate(temp = Opponent.Score.at.Start,
+         Opponent.Score.at.Start = Team.Score.at.Start,
+         Team.Score.at.Start = temp) %>%
+  select(-c('temp'))
+
+potentialSwaps = potentialSwaps %>%
+  mutate(Team_Diff = Team.Score.at.End - Team.Score.at.Start,
+         Opp_Diff = Opp.Score.at.End - Opponent.Score.at.Start,
+         Lead_Diff = Team_Diff - Opp_Diff)
+
+nrow(potentialSwaps%>%
+  filter(!Lead_Diff %in% valid_diffs))
+```
+
+After swapping, only 31 of the 1943 potential swaps weren't results of potential swaps. 
+
+NOTE: We swapped beginning scores because swapping end scores resulted in -3 differentials which are invalid (you can get -6, -7, -8 from throwing a pick 6 but you can't kick a field goal for the other team)
+
+This should give us 160 total invalid rows to remove
+
+### Combine Swapped Rows with Originally Valid Rows
+```{r}
+drives = rbind(drives, potentialSwaps) %>%
+  filter(Lead_Diff %in% valid_diffs) %>%
+  mutate(Drive.Result = factor(Drive.Result))
+nrow(drives)
+```
+Although we're adding some of the same rows back into the original dataframe, the original unswapped rows have invalid lead differentials and will be removed from the resulting dataframe. As a precaution, let's make sure all points are accounted for
+
+```{r}
+42796 - 42636 - 31 - 129 == 0
+```
+
+Rows total - Valid rows after swap - Invalid rows after swap - Invalid unswappable rows
+
+## More EDA
+
+```{r}
+drives %>%
+  ggplot(mapping = aes(x = Yards.From.Own.Endzone..Start.,
+                       y = Lead_Diff)) +
+  geom_point() + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, degree = 2), se = FALSE, color = 'red') +
+  labs(x = 'Yards From Own Endzone to Start Drive',
+       y = 'Lead Differential After Drive',
+       title = "Drive Start Location is Slightly Quadratically Correlated with Lead Differential Post-Drive")
+```
+
+## Creating A Linear and Quadratic Model For Expected Points Based on Starting Position
+```{r}
+driveSplit = initial_split(drives)
+driveTrain = training(driveSplit)
+driveTest = testing(driveSplit)
+driveLinear = lm(Lead_Diff~Yards.From.Own.Endzone..Start.,
+                 data = driveTrain)
+driveQuadratic = lm(Lead_Diff~poly(Yards.From.Own.Endzone..Start., degree = 2),
+                 data = driveTrain)
+```
+## Testing the Models
+```{r}
+driveTest = driveTest %>%
+  mutate(linearPred = predict(driveLinear, newdata = driveTest),
+         quadraticPred = predict(driveQuadratic, newdata = driveTest),
+         linearSE = (linearPred - Lead_Diff)^2,
+         quadraticSE = (quadraticPred - Lead_Diff)^2)
+linearRMSE = sqrt(mean(driveTest$linearSE))
+quadraticRMSE = sqrt(mean(driveTest$quadraticSE))
+cat('Linear Model RMSE:', linearRMSE,'\n')
+cat('Quadratic Model RMSE', quadraticRMSE)
+```
+The quadratic model yielded a lower validation RMSE which is intuitive because a negative lead differential can only happen on safeties and pick 6's which have a far lower probability of occurring further down the field.
+
+## Final Lead Differential Model
+```{r}
+coef(summary(driveQuadratic))
+```
+## Diagnostics
+```{r}
+driveTest %>%
+  ggplot(mapping = aes(y = quadraticSE,
+                       x = Yards.From.Own.Endzone..Start.)) + 
+  geom_point() +
+  labs(x = 'Yards From Own Endzone to Start',
+       y = 'Squared Error',
+       title = "The Quadratic Model Tends to Perform Worse Further Drives")
+```
+
+
+# Field Goals
+
+## EDA
+
+### Initial Plot
+```{r}
+field_goals %>%
+  ggplot(mapping = aes(x = Distance,
+                       y = Good.)) +
+  geom_point() +
+  geom_smooth(method = "glm", method.args = list(family = "binomial")) +
+  labs(x = 'Field Goal Distance (Yards)',
+       y = 'Field Goal Success Probability',
+       title = 'Field Goal Success Decreases as Distance Increases')
+```
+### Data Cleaning
+```{r}
+unblocked_FG = field_goals %>%
+  filter(mean(Distance) - (3* sd(Distance)) < Distance,
+         Distance < mean(Distance) + (3* sd(Distance)),
+         Block. == 0)
+
+unblocked_FG%>%
+  ggplot(mapping = aes(x = Distance,
+                       y = Good.)) +
+  geom_point() +
+  geom_smooth(method = "glm", method.args = list(family = "binomial")) +
+  labs(x = 'Field Goal Distance (Yards)',
+       y = 'Field Goal Success Probability',
+       title = 'Field Goal Success Probabilities Remain Similar After Removing Blocked Attempts')
+```
+## Creating The Model
+```{r}
+FG_split = initial_split(unblocked_FG, prop = .8)
+FG_train = training(FG_split)
+FG_test = testing(FG_split)
+FG_model = glm(Good.~Distance, family = 'binomial', data = FG_train)
+```
+
+## Model Diagnostics
+```{r}
+FG_test = FG_test %>%
+  mutate(prob = predict(FG_model,
+                              newdata = FG_test,
+                              type = 'response'),
+         prediction = ifelse(prob >= .5,
+                             yes = 1,
+                             no = 0),
+         Dev = -2 * ifelse(prediction == 1,
+                      yes = log(prob),
+                      no = log(1 - prob)))
+
+FG_test %>%
+  ggplot(mapping = aes(x = Distance,
+                       y = Dev)) +
+  geom_point()+
+  labs(x = 'Field Goal Distance (Yards)',
+       y = 'Deviance',
+       title = 'Prediction Deviance Increases with Distance Then Decreases')
+
+FG_train %>%
+  ggplot(mapping = aes(x = Distance,
+                       y = Good.,)) +
+  geom_point() +
+  geom_smooth(method = "glm", method.args = list(family = "binomial")) +
+  labs(x = 'Field Goal Distance (Yards)',
+       y = 'Good?',
+       title = 'Field Goal Training Logistic Regression Model')
+mean(FG_test$Good. == FG_test$prediction)
+```
+The pattern we observed in the distance vs deviance plot is fairly intuitive. Every kicker should make it from shorter distances but as you increase the distance you get to the point where some kickers can make it somewhat consistently and others straight up cannot and then you reach the point where no kicker not named Justin Tucker can reach.
+
+Also, our model yielded an 86.51% test accuracy
+
+# Fourth Downs
+
+## EDA
+```{r}
+fourth %>%
+  ggplot(mapping = aes(x = To.Go,
+                       y = Success)) +
+  geom_point() +
+  geom_smooth(method = "glm", method.args = list(family = "binomial")) +
+  labs(x = 'Yards From First Down',
+       y = 'Fourth Down Conversion',
+      title = 'Shorter Fourth Downs are Converted More Often')
+
+fourth %>%
+  ggplot(mapping = aes(x = Yards.From.Own.Endzone,
+                       y = Success)) +
+  geom_point() +
+  geom_smooth(method = "glm", method.args = list(family = "binomial")) +
+  labs(x = 'Yards From Own Endzone',
+       y = 'Fourth Down Conversion',
+      title = 'Field Positioning Seemingly has a Minimal Effect on Fourth Down Conversion Rates')
+fourth %>%
+  ggplot(mapping = aes(x = Yards.From.Own.Endzone,
+                       y = Yards)) +
+  geom_point() +
+  geom_smooth() +
+  labs(x = 'Yards From Own Endzone',
+       y = 'Fourth Down Conversion',
+      title = 'Field Positioning Seemingly has a Minimal Effect on Yards Gained on Fourth Down')
+
+fourth %>%
+  filter(Yards > 0) %>%
+  ggplot(mapping = aes(x = Yards)) +
+  geom_histogram(binwidth = 1, color = 'red') +
+  labs(y = 'Count',
+       x = ' (Positive) Yards Gained on Fourth Down',
+       title = 'Yards Gained on Fourth Down Follows a Exponential Distribution')
+```
+
+## Splitting the Data
+```{r}
+fourthSplit = initial_split(fourth, prop = .8)
+fourth_train = training(fourthSplit)
+fourth_test = testing(fourthSplit)
+```
+
+## Creating Models
+
+```{r}
+fourthLogisticModel = glm(Success~To.Go,
+                          data = fourth_train)
+fourthDecisionTree = rpart(Success~To.Go + Yards.From.Own.Endzone,
+                           data = fourth_train)
+fourthRandomForest = randomForest(Success~To.Go + Yards.From.Own.Endzone,
+                                  data = fourth_train)
+rpart.plot(fourthDecisionTree)
+```
+The Decision Tree is consistent with the logistic regression graph showing that field position has little to no effect on fourth down conversion rates.
+
+## Evaluating the Models
+```{r}
+fourth_test = fourth_test %>%
+  mutate(logregProb = predict(fourthLogisticModel, newdata = fourth_test,
+                              type = 'response'),
+         treeProb = predict(fourthDecisionTree, newdata = fourth_test),
+         forestProb = predict(fourthRandomForest, newdata = fourth_test,
+                              method = 'class'),
+         logregPredict = ifelse(logregProb >= .5,
+                                yes = 1,
+                                no = 0),
+         treePredict = ifelse(treeProb >= .5,
+                              yes = 1,
+                              no = 0),
+         forestPredict = ifelse(forestProb >= .5,
+                                yes = 1,
+                                no = 0),
+         logregCorrect = ifelse(logregPredict == Success,
+                                yes = 1,
+                                no = 0),
+         treeCorrect = ifelse(treePredict == Success,
+                              yes = 1,
+                              no = 0),
+         forestCorrect = ifelse(forestPredict == Success,
+                                yes = 1,
+                                no = 0))
+cat('Logistic Regression Accuracy:', mean(fourth_test$logregCorrect),'\n')
+cat('Decision Tree Accuracy:', mean(fourth_test$treeCorrect),'\n')
+cat('Random Forest Accuracy:', mean(fourth_test$forestCorrect))
+```
+The Logistic Regression and Decision Tree model yielded the highest test accuracy but Logistic Regression gives us a more continuous probability so we're going to roll with that.
+
+# Punts
+
+## EDA
+```{r}
+punts %>%
+  ggplot(mapping = aes(x = Yards.From.Own.Endzone,
+                       y = Net.Yards)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ poly(x, degree = 2),
+              se = FALSE, color = 'red') +
+  labs(x = 'Yards From Own End Zone',
+       y = 'Yards Netted From Punt',
+       title = 'Punting Yards and Start Position Exhibit a Quadratic Relationship')
+```
+## Bivariate Normal?
+To see how close this shape is to a bivariate normal distribution, we're going to generate random data under the assumption that it is.
+```{r}
+randomX = rnorm(n = 10000, mean = mean(punts$Yards.From.Own.Endzone),
+                sd = sd(punts$Yards.From.Own.Endzone))
+correlation = cor(punts$Yards.From.Own.Endzone, punts$Net.Yards)
+randomY = c()
+for (x in randomX) {
+  randomY = c(randomY, rnorm(1, correlation * x, 1 - (correlation^2)))
+}
+ggplot(mapping = aes(x = randomX,
+                     y = randomY)) +
+  geom_point() +
+  labs(x = 'Randomly Generated x Value',
+       y = 'Randomly Generated y Value',
+       title = "Punt Yardage and Start Point Don't Follow a Bivariate Normal Distribution")
+```
+
+## Create The Models
+```{r}
+puntSplit = initial_split(punts, prop = .8)
+puntTrain = training(puntSplit)
+puntTest = testing(puntSplit)
+
+puntLinear = lm(Net.Yards~Yards.From.Own.Endzone + 1,
+     data = puntTrain)
+puntQuadratic = lm(Net.Yards~poly(Yards.From.Own.Endzone, degree = 2),
+     data = puntTrain)
+```
+
+## Testing the Models
+```{r}
+puntTest = puntTest %>%
+  mutate(linearPred = predict(puntLinear, newdata = puntTest),
+         quadraticPred = predict(puntQuadratic, newdata = puntTest),
+         linearSE = (linearPred - Net.Yards)^2,
+         quadraticSE = (quadraticPred - Net.Yards)^2)
+linearRMSE = sqrt(mean(puntTest$linearSE))
+quadraticRMSE = sqrt(mean(puntTest$quadraticSE))
+cat('Linear Model RMSE:', linearRMSE,'\n')
+cat('Quadratic Model RMSE', quadraticRMSE)
+```
+The Quadratic Model yielded a lower validation RMSE which is intuitive because closer punts have a higher risk of reaching the end zone for a touchback.
+
+## Final Punt Net Model
+```{r}
+coef(summary(puntQuadratic))
+```
+
+# Combining the Models
+
+## When to Kick a Field Goal
+```{r}
+pointsExpected = function(distanceFromOwn) {
+  return (unname(predict(driveQuadratic,
+                         newdata = data.frame(Yards.From.Own.Endzone..Start. = distanceFromOwn))))
+}
+kickFG = function(distanceFromOwn, toGo) {
+  FG_prob = unname(predict(FG_model,data.frame(Distance = 100 + 17 - distanceFromOwn),
+                    type = 'response'))
+  E_FG = 3*FG_prob
+  E_bad = (1 - FG_prob) *  pointsExpected(100 - distanceFromOwn)
+  return (E_FG - E_bad)
+}
+
+xs = seq(0,100)
+expectedPts = c()
+for (x in xs) {
+  expectedPts = c(expectedPts, kickFG(x,0))
+}
+
+ggplot(mapping = aes(x = xs,
+                     y = expectedPts)) +
+  geom_point() +
+  labs(x = 'Distance From Own End Zone (Yards)',
+       y = 'Expected Lead Differential From Attempting a Field Goal',
+       title = 'Analyzing the Costs and Benefits of Attempting a Field Goal')
+  
+```
+
+## When to Punt the Ball
+```{r}
+puntBall = function(distanceFromOwn, toGo) {
+  expectedPuntYards = unname(predict(puntQuadratic,
+                                     newdata = data.frame(Yards.From.Own.Endzone = distanceFromOwn)))
+  expectedYardage = 100 - distanceFromOwn -expectedPuntYards
+  if (expectedYardage <= 0) {
+    expectedYardage = 25
+  }
+  return (-pointsExpected(expectedYardage))
+}
+
+xs = seq(0,100)
+expectedPts = c()
+for (x in xs) {
+  expectedPts = c(expectedPts, puntBall(x,0))
+}
+
+ggplot(mapping = aes(x = xs,
+                     y = expectedPts)) +
+  geom_point() +
+  labs(x = 'Distance From Own End Zone (Yards)',
+       y = 'Expected Lead Differential From Attempting a Field Goal',
+       title = 'Analyzing the Costs and Benefits of Attempting a Field Goal')
+```
+## When to Go For It
+```{r}
+goForIt = function(distanceFromOwn, toGo) {
+  conversionProb = unname(predict(fourthLogisticModel,
+                                  newdata = data.frame(To.Go = toGo), type = 'response'))
+  convertedPts = conversionProb * pointsExpected(distanceFromOwn + toGo)
+  failedPts = (1 - conversionProb) * pointsExpected(100 - distanceFromOwn)
+  return (convertedPts - failedPts)
+}
+```
+DISCLAIMER: This function just considers the probability of the fourth down being converted and the expected points given the field position of an incompletion (no gain) or if the conversion is ended right at the first-down line.
+
+## Combining All Three
+```{r}
+decide = function(distanceFromOwn, toGo) {
+  puntPts = puntBall(distanceFromOwn, toGo)
+  FGpts = kickFG(distanceFromOwn, toGo)
+  play = goForIt(distanceFromOwn, toGo)
+  maxPts = max(c(puntPts, FGpts, play))
+  if (maxPts == puntPts) {
+    return ('PUNT')
+  } else-if (maxPts == FGpts) {
+    return ('KICK FG')
+  } else-if (maxPts == play) {
+    return ('GO FOR IT')
+  } else {
+    return ('idk')
+  }
+}
+position = c()
+yardsToGo = c()
+decision = c()
+for (LOS in seq(1,99)) {
+  for (togo in seq(0, 100-LOS)) {
+    position = c(position, LOS)
+    yardsToGo = c(yardsToGo, togo)
+    decision = c(decision, decide(LOS, togo))
+  }
+}
+decisionChart = data.frame(Yards.From.Own.Endzone = position,
+           Yards.To.TD = 100 - position,
+           Yards.To.First = yardsToGo,
+           Decision = decision)
+tail(decisionChart, 5)
+```
+As shown above, the model has yet to consider if a touchdown was scored on the conversion attempt. Decisions seem highly affected by the model for expected points off field positioning... which isn't doing the best job.
+
+# Full Decision Chart
+
+## Go For It
+```{r}
+decisionChart %>%
+  filter(Decision == 'GO FOR IT')
+```
+## Punt
+```{r}
+decisionChart %>%
+  filter(Decision == 'PUNT')
+```
+
+## Kick the Field Goal
+```{r}
+decisionChart %>%
+  filter(Decision == 'KICK FG')
+```
+
